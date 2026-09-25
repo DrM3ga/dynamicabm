@@ -1,0 +1,931 @@
+"""
+community_sirs.py
+=================
+Focused SIRS agent-based model for endemic virulence evolution on a small
+community-structured dynamic contact network.
+
+The model uses continuous-time Gillespie dynamics. Hosts live in two or
+three Watts-Strogatz communities. Virulence is a heritable continuous
+phenotype assigned at infection and controls transmission, recovery,
+disease mortality, behavioral edge removal, and inter-community movement.
+
+The main implementation idea is:
+
+1. Build an initial local contact graph inside each community.
+2. Keep a mutable active graph as sets of neighbors, because edges are added
+   and removed during the simulation.
+3. At each Gillespie step, enumerate all currently possible events and their
+   rates, draw the waiting time, then draw exactly one event proportional to
+   its rate.
+4. Record regularly spaced samples after burn-in so endemic behavior can be
+   summarized and plotted.
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import csv
+import math
+import sys
+import time as _time
+from dataclasses import dataclass
+from pathlib import Path
+
+import networkx as nx
+import numpy as np
+
+
+STATE_S = 0
+STATE_I = 1
+STATE_R = 2
+STATE_D = 3
+
+
+@dataclass(frozen=True)
+class TradeoffParams:
+    """Bounds and shape choices for mapping virulence into event rates.
+
+    The simulation stores virulence as one scalar per host. These parameters
+    define how that scalar becomes biologically meaningful event rates:
+    beta, alpha, gamma, delta, and phi. Keeping the mapping in one dataclass
+    makes sensitivity analysis easier, because a future sweep can vary these
+    fields without changing the Gillespie logic.
+    """
+
+    v_min: float
+    v_max: float
+    beta_min: float
+    beta_max: float
+    alpha_min: float
+    alpha_max: float
+    gamma_min: float
+    gamma_max: float
+    delta_min: float
+    delta_max: float
+    phi_max: float
+    beta_shape: str
+    alpha_shape: str
+    gamma_shape: str
+    delta_shape: str
+    phi_shape: str
+
+
+# One row per realization. These are the quantities most useful for endemic
+# steady-state comparison across seeds or later sensitivity-analysis grids.
+SUMMARY_FIELDS = [
+    "realization",
+    "seed",
+    "N",
+    "K",
+    "t_final",
+    "samples",
+    "inter_edge_decay_rate",
+    "extinct",
+    "mean_prevalence",
+    "final_prevalence",
+    "mean_s_frac",
+    "final_s_frac",
+    "mean_r_frac",
+    "final_r_frac",
+    "mean_d_frac",
+    "final_d_frac",
+    "mean_infected_virulence",
+    "final_infected_virulence",
+    "mean_virulence_variance",
+    "final_virulence_variance",
+    "cumulative_deaths",
+    "mean_intercommunity_transmissions",
+    "final_intercommunity_transmissions",
+    "mean_active_edges",
+    "final_active_edges",
+    "mean_inter_edges",
+    "final_inter_edges",
+    "realized_clustering",
+]
+
+# Per-sample rows are intentionally richer than summary rows. Plotting and
+# snapshot tooling should read these instead of trying to reconstruct state
+# from one-row-per-realization summaries.
+SAMPLE_FIELDS = [
+    "realization",
+    "seed",
+    "t",
+    "inter_edge_decay_rate",
+    "S",
+    "I",
+    "R",
+    "D",
+    "prevalence",
+    "s_frac",
+    "r_frac",
+    "d_frac",
+    "mean_infected_virulence",
+    "virulence_variance",
+    "active_edges",
+    "inter_edges",
+    "realized_clustering",
+    "cumulative_deaths",
+    "cumulative_intercommunity_transmissions",
+    "extinct",
+]
+
+
+def _edge(u: int, v: int) -> tuple[int, int]:
+    """Canonicalize an undirected edge so it can be stored in a set."""
+    return (u, v) if u < v else (v, u)
+
+
+def split_communities(N: int, K: int) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Assign hosts to K communities as evenly as integer sizes allow.
+
+    Returns both a per-node community_id array and a list of node arrays. The
+    first form is convenient for quickly testing whether an edge is local or
+    inter-community; the second is convenient when drawing a random movement
+    partner from a different community.
+    """
+    sizes = [N // K + (1 if c < (N % K) else 0) for c in range(K)]
+    community_id = np.empty(N, dtype=np.int64)
+    communities: list[np.ndarray] = []
+    start = 0
+    for c, size in enumerate(sizes):
+        nodes = np.arange(start, start + size, dtype=np.int64)
+        community_id[nodes] = c
+        communities.append(nodes)
+        start += size
+    return community_id, communities
+
+
+def build_community_graph(N: int, K: int, kbar: int, rewiring_prob: float,
+                          seed: int | None):
+    """
+    Build disjoint Watts-Strogatz communities and adjacency sets.
+
+    N: total number of nodes
+    K: number of communities
+    kbar: target local degree inside each community. 
+        Higher kbar means denser local communities. Lower kbar means sparser communities.
+    rewiring_prob: This controls how locally clustered vs random the within-community graph is.
+
+    The graph starts with only within-community contacts. Inter-community
+    contacts appear later through movement events, so the model can distinguish
+    stable local social structure from transient long-range connectivity.
+    """
+    community_id, communities = split_communities(N, K)
+    # active_adj is the mutable contact network used by Gillespie events;
+    # baseline_adj records the initial local social structure for diagnostics
+    # and future extensions.
+    active_adj = [set() for _ in range(N)]
+    baseline_adj = [set() for _ in range(N)]
+    rng_seed = seed
+
+    for c, nodes in enumerate(communities):
+        size = len(nodes)
+        if size <= 1:
+            continue
+        k = _local_degree(size, kbar)
+        local = nx.watts_strogatz_graph(size, k, rewiring_prob,
+                                        seed=None if rng_seed is None else rng_seed + c)
+        for u_local, v_local in local.edges():
+            u = int(nodes[u_local])
+            v = int(nodes[v_local])
+            active_adj[u].add(v)
+            active_adj[v].add(u)
+            baseline_adj[u].add(v)
+            baseline_adj[v].add(u)
+
+    return community_id, communities, active_adj, baseline_adj
+
+
+def _local_degree(size: int, kbar: int) -> int:
+    """Target local ring degree for a community of this size.
+
+    Shared by build_community_graph (initial graph) and generate_node_edges
+    (newborn rewiring after a death) so both use the identical rule: NetworkX
+    Watts-Strogatz requires an even k for ring-neighbor wiring.
+    """
+    k = min(kbar, size - 1)
+    if k % 2 == 1:
+        k -= 1
+    if k < 2:
+        k = 2 if size > 2 else 1
+    return k
+
+
+def _ring_neighbors(pos: int, size: int, k: int) -> list[int]:
+    """Ring-lattice neighbor positions used as the Watts-Strogatz template.
+
+    Mirrors the neighbor pattern nx.watts_strogatz_graph starts from before
+    rewiring: each node connects to its k/2 nearest neighbors on each side of
+    a ring of `size` positions.
+    """
+    half = k // 2
+    neighbors = []
+    for d in range(1, half + 1):
+        neighbors.append((pos + d) % size)
+        neighbors.append((pos - d) % size)
+    return neighbors
+
+
+def generate_node_edges(node: int, community_nodes: np.ndarray, kbar: int,
+                        rewiring_prob: float, active_adj: list[set[int]],
+                        rng: np.random.Generator, max_attempts: int = 25):
+    """Wire a (re)generated node into its community.
+
+    Used when a dead host is replaced by a newborn: the newborn's local
+    contacts are drawn from the same Watts-Strogatz ring-plus-rewiring
+    process used to build the community at initialization (see
+    build_community_graph), applied to this one node's position within the
+    community's fixed node ordering, rather than leaving the newborn with no
+    contacts. Only edges to other members of the same community are created,
+    matching the initial graph, which starts with purely within-community
+    structure.
+    """
+    size = community_nodes.size
+    if size <= 1:
+        return
+    k = _local_degree(size, kbar)
+    pos = int(np.searchsorted(community_nodes, node))
+    for tpos in _ring_neighbors(pos, size, k):
+        target = int(community_nodes[tpos])
+        if target == node:
+            continue
+        if rng.random() < rewiring_prob:
+            # Rewire this template edge to a uniformly random community
+            # member, mirroring nx.watts_strogatz_graph's own rewiring step.
+            for _ in range(max_attempts):
+                candidate = int(rng.choice(community_nodes))
+                if candidate != node and candidate not in active_adj[node]:
+                    target = candidate
+                    break
+        if target != node:
+            active_adj[node].add(target)
+            active_adj[target].add(node)
+
+
+def active_edges(active_adj: list[set[int]]) -> set[tuple[int, int]]:
+    """Return current usable contact edges without double-counting.
+
+    active_adj stores each undirected edge twice, once in each endpoint's
+    neighbor set. Most model calculations need each edge once, so this helper
+    canonicalizes edges as u < v.
+    """
+    out = set()
+    for u, neigh in enumerate(active_adj):
+        for v in neigh:
+            if u < v:
+                out.add((u, v))
+    return out
+
+
+def realized_clustering(active_adj: list[set[int]], alive_mask: np.ndarray) -> float:
+    """Compute clustering on the active network after removing dead hosts.
+
+    Clustering is reported on the graph that disease processes can actually
+    use at that time. Dead hosts are excluded because mortality permanently
+    removes them and their incident edges from the contact network.
+    """
+    G = nx.Graph()
+    alive_nodes = np.where(alive_mask)[0].tolist()
+    G.add_nodes_from(alive_nodes)
+    for u, v in active_edges(active_adj):
+        if alive_mask[u] and alive_mask[v]:
+            G.add_edge(u, v)
+    if len(G) < 3:
+        return 0.0
+    return float(nx.average_clustering(G))
+
+
+def shape_value(z: np.ndarray | float, shape: str) -> np.ndarray | float:
+    """Apply the requested sensitivity shape on normalized virulence z.
+
+    z is always clipped into [0, 1]. The shapes are intentionally simple:
+    linear gives a straight trade-off, concave gives diminishing returns, and
+    convex gives weak effects at low virulence with stronger effects near the
+    upper end of the phenotype range.
+    """
+    z = np.clip(z, 0.0, 1.0)
+    if shape == "linear":
+        return z
+    if shape == "concave":
+        return np.sqrt(z)
+    if shape == "convex":
+        return z * z
+    raise ValueError(f"unknown shape: {shape}")
+
+
+def bounded_tradeoff(v: np.ndarray | float, params: TradeoffParams, low: float,
+                     high: float, shape: str, increasing: bool) -> np.ndarray | float:
+    """Convert virulence into a bounded rate with controlled shape/direction.
+
+    This is the shared transformation for every virulence-dependent rate. It
+    first normalizes v to the phenotype interval, applies the chosen curve, and
+    then maps that curve onto [low, high]. For decreasing trade-offs, the curve
+    is flipped so high virulence produces lower rates.
+    """
+    denom = params.v_max - params.v_min
+    if denom <= 0:
+        raise ValueError("v_max must be greater than v_min")
+    z = (v - params.v_min) / denom
+    factor = shape_value(z, shape)
+    if not increasing:
+        factor = 1.0 - factor
+    return low + (high - low) * factor
+
+
+def beta_of(v, params: TradeoffParams):
+    """Per-contact transmission rate; higher virulence transmits better."""
+    return bounded_tradeoff(v, params, params.beta_min, params.beta_max,
+                            params.beta_shape, increasing=True)
+
+
+def alpha_of(v, params: TradeoffParams):
+    """Disease-induced mortality rate; higher virulence is more lethal."""
+    return bounded_tradeoff(v, params, params.alpha_min, params.alpha_max,
+                            params.alpha_shape, increasing=True)
+
+
+def gamma_of(v, params: TradeoffParams):
+    """Recovery rate; higher virulence is harder to clear."""
+    return bounded_tradeoff(v, params, params.gamma_min, params.gamma_max,
+                            params.gamma_shape, increasing=False)
+
+
+def delta_of(v, params: TradeoffParams):
+    """Behavioral edge-removal rate; higher virulence induces more avoidance."""
+    return bounded_tradeoff(v, params, params.delta_min, params.delta_max,
+                            params.delta_shape, increasing=True)
+
+
+def phi_of(v, params: TradeoffParams):
+    """Rate of an isolated inter-community contact/transmission event for an
+    infected host; higher virulence reduces mobility, so fewer such contacts
+    occur."""
+    return bounded_tradeoff(v, params, 0.0, params.phi_max,
+                            params.phi_shape, increasing=False)
+
+
+def restore_edges(i: int, state: np.ndarray, active_adj: list[set[int]],
+                  severed_edges: list[set[tuple[int, int]]]):
+    # Recovery restores the contacts lost during this infection episode,
+    # unless the other endpoint has died in the meantime.
+    for u, v in list(severed_edges[i]):
+        if state[u] != STATE_D and state[v] != STATE_D:
+            active_adj[u].add(v)
+            active_adj[v].add(u)
+    severed_edges[i].clear()
+
+
+def remove_all_edges(i: int, active_adj: list[set[int]],
+                     severed_edges: list[set[tuple[int, int]]]):
+    # Disease mortality is absorbing: dead hosts leave the active graph.
+    for j in list(active_adj[i]):
+        active_adj[j].discard(i)
+        active_adj[i].discard(j)
+    severed_edges[i].clear()
+
+
+def attempt_inter_community_transmission(i: int, state: np.ndarray, community_id: np.ndarray,
+                                         communities: list[np.ndarray],
+                                         rng: np.random.Generator,
+                                         max_attempts: int = 25) -> int | None:
+    """Draw a random host in a different community for a one-off contact.
+
+    Inter-community transmission is modeled as an isolated exposure event
+    rather than a persistent bridging edge: host i reaches out to a random
+    member of another community for this single event only. This function
+    only selects the contact; it never mutates active_adj, so no lasting
+    edge is ever recorded, and the caller decides whether the disease
+    actually passes (only if the contact is susceptible).
+    """
+    if state[i] == STATE_D:
+        return None
+    other_communities = [c for c in range(len(communities)) if c != community_id[i]]
+    # Try a bounded number of random partners; saturated small graphs can make
+    # valid cross-community endpoints temporarily hard to find.
+    for _ in range(max_attempts):
+        c = int(rng.choice(other_communities))
+        candidates = communities[c]
+        if candidates.size == 0:
+            continue
+        j = int(rng.choice(candidates))
+        if state[j] == STATE_D or j == i:
+            continue
+        return j
+    return None
+
+
+def remove_edge(edge: tuple[int, int], active_adj: list[set[int]]):
+    """Remove an undirected active edge if it is still present."""
+    u, v = edge
+    active_adj[u].discard(v)
+    active_adj[v].discard(u)
+
+
+def count_inter_edges(active_adj: list[set[int]], community_id: np.ndarray) -> int:
+    """Count currently active edges whose endpoints are in different communities."""
+    return sum(1 for u, v in active_edges(active_adj) if community_id[u] != community_id[v])
+
+
+def summarize_state(t: float, state: np.ndarray, virulence: np.ndarray,
+                    active_adj: list[set[int]], community_id: np.ndarray) -> dict[str, float]:
+    """Compute all per-timepoint metrics used by summaries, plots, and snapshots.
+
+    This function deliberately contains no random draws or state mutation. It
+    is safe to call at arbitrary sample or snapshot times and gives the same
+    definitions everywhere in the codebase.
+    """
+    N = state.shape[0]
+    infected = state == STATE_I
+    s_count = int(np.count_nonzero(state == STATE_S))
+    i_count = int(np.count_nonzero(infected))
+    r_count = int(np.count_nonzero(state == STATE_R))
+    d_count = int(np.count_nonzero(state == STATE_D))
+    alive_mask = state != STATE_D
+    if i_count:
+        infected_v = virulence[infected]
+        mean_v = float(np.mean(infected_v))
+        var_v = float(np.var(infected_v))
+    else:
+        mean_v = math.nan
+        var_v = math.nan
+    return {
+        "t": t,
+        "S": s_count,
+        "I": i_count,
+        "R": r_count,
+        "D": d_count,
+        "prevalence": i_count / N,
+        "s_frac": s_count / N,
+        "r_frac": r_count / N,
+        "d_frac": d_count / N,
+        "mean_infected_virulence": mean_v,
+        "virulence_variance": var_v,
+        "active_edges": float(len(active_edges(active_adj))),
+        "inter_edges": float(count_inter_edges(active_adj, community_id)),
+        "realized_clustering": realized_clustering(active_adj, alive_mask),
+    }
+
+
+def choose_weighted_event(events: list[tuple[str, tuple, float]],
+                          total_rate: float, rng: np.random.Generator):
+    """Draw one Gillespie event proportional to its event rate."""
+    threshold = rng.random() * total_rate
+    acc = 0.0
+    for kind, payload, rate in events:
+        acc += rate
+        if threshold <= acc:
+            return kind, payload
+    return events[-1][0], events[-1][1]
+
+
+def collect_events(state: np.ndarray, virulence: np.ndarray, active_adj: list[set[int]],
+                   community_id: np.ndarray, params: TradeoffParams, rho: float):
+    """Enumerate every event currently available to the Gillespie sampler.
+
+    The returned event list is explicit rather than optimized: each tuple is
+    (event_kind, payload, rate). That makes the model readable and easy to
+    audit. For larger simulations, this is the main place to optimize, because
+    it rebuilds the event list from the active graph at every event.
+    """
+    events: list[tuple[str, tuple, float]] = []
+
+    # Edge-local events: transmission along S-I contacts and behavioral
+    # removal of contacts incident to infectious hosts. active_adj only ever
+    # holds within-community edges now: inter-community contact is handled
+    # below as an isolated, non-persistent event, not as a graph edge.
+    for u, v in active_edges(active_adj):
+        su = state[u]
+        sv = state[v]
+        if su == STATE_S and sv == STATE_I:
+            events.append(("transmission", (u, v), float(beta_of(virulence[v], params))))
+        elif su == STATE_I and sv == STATE_S:
+            events.append(("transmission", (v, u), float(beta_of(virulence[u], params))))
+
+        if su == STATE_I:
+            events.append(("edge_removal", (u, v, u), float(delta_of(virulence[u], params))))
+        if sv == STATE_I:
+            events.append(("edge_removal", (u, v, v), float(delta_of(virulence[v], params))))
+
+    # Node-local disease events depend on the infected host's virulence.
+    infected_idx = np.where(state == STATE_I)[0]
+    for i in infected_idx:
+        v = virulence[i]
+        events.append(("recovery", (int(i),), float(gamma_of(v, params))))
+        events.append(("mortality", (int(i),), float(alpha_of(v, params))))
+
+    # Waning immunity is a node event.
+    recovered_idx = np.where(state == STATE_R)[0]
+    for i in recovered_idx:
+        events.append(("waning", (int(i),), float(rho)))
+
+    # Inter-community transmission: an isolated, instantaneous contact event
+    # rather than a persistent bridging edge. Only infected hosts generate
+    # this event, since only they can transmit; the rate reuses the same
+    # virulence-dependent phi(v) that previously governed how often an
+    # infected host initiated cross-community movement.
+    for i in infected_idx:
+        events.append(("inter_transmission", (int(i),), float(phi_of(virulence[i], params))))
+
+    # Zero-rate events are harmless conceptually but would distort the event
+    # picker if total_rate and the list disagreed, so filter them once here.
+    total_rate = sum(rate for _, _, rate in events if rate > 0.0)
+    if total_rate <= 0.0:
+        return [], 0.0
+    events = [(kind, payload, rate) for kind, payload, rate in events if rate > 0.0]
+    return events, total_rate
+
+
+def snapshot_state(t: float, state: np.ndarray, virulence: np.ndarray,
+                   active_adj: list[set[int]], community_id: np.ndarray,
+                   cumulative_deaths: int) -> dict:
+    """Copy mutable simulation state for later network rendering.
+
+    active_adj is a list of mutable sets, so a shallow copy would continue to
+    change as the simulation runs. The deep copy freezes the graph exactly as
+    it looked at the requested snapshot time.
+    """
+    return {
+        "t": t,
+        "state": state.copy(),
+        "virulence": virulence.copy(),
+        "active_adj": copy.deepcopy(active_adj),
+        "community_id": community_id.copy(),
+        "cumulative_deaths": cumulative_deaths,
+    }
+
+
+def add_sample_context(sample: dict[str, float], realization: int,
+                       seed_value: int | str, cumulative_deaths: int,
+                       cumulative_intercommunity_transmissions: int,
+                       inter_edge_decay_rate: float) -> dict:
+    """Attach run metadata to one sampled state row.
+
+    The plotting script expects each row to be self-contained: it should know
+    which realization it came from, what seed generated that realization, and
+    how many deaths and cross-community infections had accumulated by that
+    sample time.
+    """
+    row = {
+        "realization": realization,
+        "seed": seed_value,
+        **sample,
+        "inter_edge_decay_rate": inter_edge_decay_rate,
+        "cumulative_deaths": cumulative_deaths,
+        "cumulative_intercommunity_transmissions": cumulative_intercommunity_transmissions,
+        "extinct": int(sample["I"] == 0),
+    }
+    return {field: row.get(field, "") for field in SAMPLE_FIELDS}
+
+
+def run_one_realization(args, realization: int, rng: np.random.Generator,
+                        return_samples: bool = False,
+                        snapshot_times: list[float] | None = None):
+    """Run one stochastic realization and return summary/sample/snapshot data.
+
+    This function is the model's main state machine. It owns the mutable host
+    arrays and active graph, while helper functions handle rate construction,
+    event selection, and metric calculation.
+    """
+    params = TradeoffParams(
+        v_min=args.v_min, v_max=args.v_max,
+        beta_min=args.beta_min, beta_max=args.beta_max,
+        alpha_min=args.alpha_min, alpha_max=args.alpha_max,
+        gamma_min=args.gamma_min, gamma_max=args.gamma_max,
+        delta_min=args.delta_min, delta_max=args.delta_max,
+        phi_max=args.phi_max,
+        beta_shape=args.beta_shape, alpha_shape=args.alpha_shape,
+        gamma_shape=args.gamma_shape, delta_shape=args.delta_shape,
+        phi_shape=args.phi_shape,
+    )
+    graph_seed = None if args.seed is None else args.seed + realization * 1009 # so every realization start with different network
+    community_id, communities, active_adj, _baseline_adj = build_community_graph(
+        args.N, args.K, args.kbar, args.rewiring_prob, graph_seed)
+
+    state = np.full(args.N, STATE_S, dtype=np.int8)
+    virulence = np.full(args.N, args.v_init, dtype=np.float64)
+    infection_count = np.zeros(args.N, dtype=np.int64)
+    severed_edges = [set() for _ in range(args.N)]
+
+    # Seed the endemic simulation with a small infected fraction. Setting
+    # --initial-prevalence 0 is allowed for extinction/output sanity checks.
+    n_initial = int(round(args.initial_prevalence * args.N))
+    if args.initial_prevalence > 0.0:
+        n_initial = max(1, n_initial)
+    initial = rng.choice(args.N, size=n_initial, replace=False)
+    if n_initial:
+        state[initial] = STATE_I
+        infection_count[initial] = 1
+
+    t = 0.0
+    cumulative_deaths = 0
+    cumulative_intercommunity_transmissions = 0
+    extinct = 0
+    next_sample = args.burn_in_time
+    samples: list[dict[str, float]] = []
+    sample_rows: list[dict] = []
+    snapshots: list[dict] = []
+    seed_value = "" if args.seed is None else args.seed + realization
+    requested_snapshots = sorted(snapshot_times or [])
+    next_snapshot = 0
+
+    def capture_samples_until(limit: float):
+        """Record regularly spaced samples up to a continuous-time limit."""
+        nonlocal next_sample # outside defined variable used inside function
+        while next_sample <= limit:
+            sample = summarize_state(next_sample, state, virulence, active_adj, community_id)
+            # Store cumulative event counters inside the internal sample list
+            # too, so summary means can use the same post-burn-in samples that
+            # the plotting CSV receives.
+            sample["cumulative_intercommunity_transmissions"] = cumulative_intercommunity_transmissions
+            samples.append(sample)
+            if return_samples:
+                sample_rows.append(add_sample_context(
+                    sample, realization, seed_value, cumulative_deaths,
+                    cumulative_intercommunity_transmissions,
+                    args.inter_edge_decay_rate))
+            next_sample += args.sample_interval # samples are saved with fixed intervals
+
+    def capture_snapshots_until(limit: float):
+        """Freeze graph/host state for all requested snapshots reached so far."""
+        nonlocal next_snapshot
+        while next_snapshot < len(requested_snapshots) and requested_snapshots[next_snapshot] <= limit:
+            snapshots.append(snapshot_state(
+                requested_snapshots[next_snapshot], state, virulence,
+                active_adj, community_id, cumulative_deaths))
+            next_snapshot += 1
+
+    while t < args.t_max:
+        # Gillespie step 1: compute the total event rate in the current state.
+        events, total_rate = collect_events(
+            state, virulence, active_adj, community_id, params, args.rho)
+        if total_rate <= 0.0:
+            break
+        # Gillespie step 2: draw the waiting time until the next event.
+        t_next = t + float(rng.exponential(1.0 / total_rate)) #stochastic event time
+        event_limit = min(t_next, args.t_max)
+
+        # Samples summarize the state just before the next event, after burn-in.
+        capture_samples_until(event_limit)
+        capture_snapshots_until(event_limit)
+
+        if t_next > args.t_max:
+            t = args.t_max
+            break
+        t = t_next
+        # Gillespie step 3: choose which event fires at time t.
+        kind, payload = choose_weighted_event(events, total_rate, rng)
+
+        if kind == "transmission":
+            susceptible, source = payload
+            if state[susceptible] == STATE_S and state[source] == STATE_I:
+                # Payload order is (new host, infecting host). Only the source
+                # strain determines offspring virulence.
+                state[susceptible] = STATE_I
+                infection_count[susceptible] += 1
+                # This is the realized connectivity-dependent event of
+                # interest: an infection that actually crosses community
+                # membership through an active edge. In practice active_adj
+                # only ever holds within-community edges now (see
+                # inter_transmission for how cross-community spread happens),
+                # so this branch is defensive rather than a normal path.
+                if community_id[susceptible] != community_id[source]:
+                    cumulative_intercommunity_transmissions += 1
+                # Virulence is inherited from the source strain with mutation.
+                child_v = virulence[source] + rng.normal(0.0, args.sigma_m)
+                virulence[susceptible] = float(np.clip(child_v, args.v_min, args.v_max))
+                severed_edges[susceptible].clear()
+        elif kind == "recovery":
+            (i,) = payload
+            if state[i] == STATE_I:
+                # Recovered hosts retain immunity until a later waning event.
+                state[i] = STATE_R
+                restore_edges(i, state, active_adj, severed_edges)
+        elif kind == "mortality":
+            (i,) = payload
+            if state[i] == STATE_I:
+                # Death is immediately replaced by a birth: host i is removed
+                # along with all of its edges, then a newborn is generated in
+                # its place, wired into the same community using the same
+                # edge-generation process used at initialization
+                # (generate_node_edges). Population size N therefore stays
+                # fixed for the whole run; cumulative_deaths counts
+                # death/birth turnover events rather than a shrinking,
+                # permanently-dead population, and STATE_D is never actually
+                # observed in the post-event state.
+                cumulative_deaths += 1
+                remove_all_edges(i, active_adj, severed_edges)
+                state[i] = STATE_S
+                virulence[i] = args.v_init
+                infection_count[i] = 0
+                generate_node_edges(i, communities[community_id[i]], args.kbar,
+                                    args.rewiring_prob, active_adj, rng)
+        elif kind == "waning":
+            (i,) = payload
+            if state[i] == STATE_R:
+                # Waning restores susceptibility but does not alter contacts.
+                state[i] = STATE_S
+        elif kind == "edge_removal":
+            u, v, owner = payload
+            if v in active_adj[u] and state[owner] == STATE_I:
+                remove_edge((u, v), active_adj)
+                # Record the owner of the behavioral severing so only that
+                # host's recovery restores this contact.
+                severed_edges[owner].add(_edge(u, v))
+        elif kind == "inter_transmission":
+            (i,) = payload
+            if state[i] == STATE_I:
+                # Pick a one-off contact in another community. No edge is
+                # ever added to active_adj: the contact exists only for the
+                # instant this event fires, so the link is severed by
+                # construction rather than through a later decay event.
+                j = attempt_inter_community_transmission(
+                    i, state, community_id, communities, rng)
+                if j is not None and state[j] == STATE_S:
+                    state[j] = STATE_I
+                    infection_count[j] += 1
+                    cumulative_intercommunity_transmissions += 1
+                    child_v = virulence[i] + rng.normal(0.0, args.sigma_m)
+                    virulence[j] = float(np.clip(child_v, args.v_min, args.v_max))
+                    severed_edges[j].clear()
+
+    # If the process ended early because no positive-rate events remain, still
+    # fill requested sample/snapshot times with the final frozen state.
+    capture_samples_until(args.t_max)
+    capture_snapshots_until(args.t_max)
+
+    final = summarize_state(t, state, virulence, active_adj, community_id)
+    if not np.any(state == STATE_I):
+        extinct = 1
+
+    def sample_mean(key: str) -> float:
+        """Average a metric over post-burn-in samples, ignoring NaNs."""
+        vals = np.array([s[key] for s in samples], dtype=np.float64)
+        if vals.size == 0:
+            return math.nan
+        if np.all(np.isnan(vals)):
+            return math.nan
+        return float(np.nanmean(vals))
+
+    summary = {
+        "realization": realization,
+        "seed": seed_value,
+        "N": args.N,
+        "K": args.K,
+        "t_final": t,
+        "samples": len(samples),
+        "inter_edge_decay_rate": args.inter_edge_decay_rate,
+        "extinct": extinct,
+        "mean_prevalence": sample_mean("prevalence"),
+        "final_prevalence": final["prevalence"],
+        "mean_s_frac": sample_mean("s_frac"),
+        "final_s_frac": final["s_frac"],
+        "mean_r_frac": sample_mean("r_frac"),
+        "final_r_frac": final["r_frac"],
+        "mean_d_frac": sample_mean("d_frac"),
+        "final_d_frac": final["d_frac"],
+        "mean_infected_virulence": sample_mean("mean_infected_virulence"),
+        "final_infected_virulence": final["mean_infected_virulence"],
+        "mean_virulence_variance": sample_mean("virulence_variance"),
+        "final_virulence_variance": final["virulence_variance"],
+        "cumulative_deaths": cumulative_deaths,
+        "mean_intercommunity_transmissions": sample_mean("cumulative_intercommunity_transmissions"),
+        "final_intercommunity_transmissions": cumulative_intercommunity_transmissions,
+        "mean_active_edges": sample_mean("active_edges"),
+        "final_active_edges": final["active_edges"],
+        "mean_inter_edges": sample_mean("inter_edges"),
+        "final_inter_edges": final["inter_edges"],
+        "realized_clustering": final["realized_clustering"],
+    }
+    if return_samples or snapshot_times is not None:
+        return summary, sample_rows, snapshots
+    return summary
+
+
+def run_sweep(args):
+    """Run independent realizations and collect summary plus optional samples."""
+    rng = np.random.default_rng(args.seed)
+    rows = []
+    all_samples = []
+    t_start = _time.time()
+    for realization in range(args.realizations):
+        result = run_one_realization(args, realization, rng,
+                                     return_samples=bool(args.samples_out))
+        if args.samples_out:
+            row, sample_rows, _snapshots = result
+            all_samples.extend(sample_rows)
+        else:
+            row = result
+        rows.append(row)
+        if not args.quiet:
+            elapsed = _time.time() - t_start
+            print(f"[CommunitySIRS] {realization + 1}/{args.realizations} "
+                  f"prevalence={row['final_prevalence']:.3f} "
+                  f"deaths={row['cumulative_deaths']} "
+                  f"elapsed={elapsed:.1f}s", file=sys.stderr)
+    return rows, all_samples
+
+
+def build_arg_parser(prog: str = "CommunitySIRS") -> argparse.ArgumentParser:
+    """Define the public CLI shared by simulation and snapshot scripts."""
+    p = argparse.ArgumentParser(prog=prog, description=__doc__)
+    p.add_argument("--out", default="results/summary.csv",
+                   help="output CSV path")
+    p.add_argument("--samples-out", default= "results/samples.csv",
+                   help="optional per-sample CSV path for plotting steady-state trajectories")
+    p.add_argument("--N", type=int, default=100, help="population size")
+    p.add_argument("--K", type=int, choices=[2, 3], default=3,
+                   help="number of communities; only 2 or 3 are supported")
+    p.add_argument("--kbar", type=int, default=8,
+                   help="Watts-Strogatz local mean degree target")
+    p.add_argument("--rewiring-prob", type=float, default=0.01,
+                   help="Watts-Strogatz rewiring probability")
+    p.add_argument("--t-max", type=float, default=500.0)
+    p.add_argument("--burn-in-time", type=float, default=100.0)
+    p.add_argument("--sample-interval", type=float, default=1.0)
+    p.add_argument("--realizations", type=int, default=10)
+    p.add_argument("--initial-prevalence", type=float, default=0.05)
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--quiet", action="store_true", help="suppress progress output")
+
+    p.add_argument("--v-min", type=float, default=0.0)
+    p.add_argument("--v-max", type=float, default=1.0)
+    p.add_argument("--v-init", type=float, default=0.3)
+    p.add_argument("--sigma-m", type=float, default=0.02,
+                   help="per-transmission virulence mutation standard deviation")
+
+    p.add_argument("--beta-min", type=float, default=0.0)
+    p.add_argument("--beta-max", type=float, default=0.08)
+    p.add_argument("--alpha-min", type=float, default=0.0)
+    p.add_argument("--alpha-max", type=float, default=0.01)
+    p.add_argument("--gamma-min", type=float, default=0.02)
+    p.add_argument("--gamma-max", type=float, default=0.12)
+    p.add_argument("--delta-min", type=float, default=0.0)
+    p.add_argument("--delta-max", type=float, default=0.03)
+    p.add_argument("--phi-max", type=float, default=0.02)
+    p.add_argument("--inter-edge-decay-rate", type=float, default=0.02,
+                   help="Unused by the simulation itself: inter-community contact "
+                        "is now an isolated, immediately-severed event (see "
+                        "--phi-max) rather than a persistent edge that decays. "
+                        "Kept only so existing summary/sample CSV columns and "
+                        "wrapper scripts keep working.")
+    p.add_argument("--rho", type=float, default=0.01,
+                   help="waning immunity rate")
+
+    shapes = ["linear", "concave", "convex"]
+    p.add_argument("--beta-shape", choices=shapes, default="concave")
+    p.add_argument("--alpha-shape", choices=shapes, default="linear")
+    p.add_argument("--gamma-shape", choices=shapes, default="linear")
+    p.add_argument("--delta-shape", choices=shapes, default="linear")
+    p.add_argument("--phi-shape", choices=shapes, default="linear")
+    return p
+
+
+def validate_args(args):
+    """Fail fast on parameter combinations that would make the model invalid."""
+    if args.N < args.K:
+        raise SystemExit("--N must be at least --K")
+    if args.v_max <= args.v_min:
+        raise SystemExit("--v-max must be greater than --v-min")
+    if not (args.v_min <= args.v_init <= args.v_max):
+        raise SystemExit("--v-init must lie between --v-min and --v-max")
+    if args.sample_interval <= 0:
+        raise SystemExit("--sample-interval must be positive")
+    if args.t_max <= 0:
+        raise SystemExit("--t-max must be positive")
+    if args.burn_in_time < 0 or args.burn_in_time > args.t_max:
+        raise SystemExit("--burn-in-time must be between 0 and --t-max")
+    if not (0.0 <= args.initial_prevalence <= 1.0):
+        raise SystemExit("--initial-prevalence must be between 0 and 1")
+    if args.rewiring_prob < 0.0 or args.rewiring_prob > 1.0:
+        raise SystemExit("--rewiring-prob must be between 0 and 1")
+    for name in ["beta", "alpha", "gamma", "delta"]:
+        lo = getattr(args, f"{name}_min")
+        hi = getattr(args, f"{name}_max")
+        if lo < 0 or hi < 0 or hi < lo:
+            raise SystemExit(f"--{name}-min/--{name}-max must be nonnegative and ordered")
+    if (args.phi_max < 0 or args.inter_edge_decay_rate < 0
+            or args.rho < 0 or args.sigma_m < 0):
+        raise SystemExit("--phi-max, --inter-edge-decay-rate, --rho, and --sigma-m must be nonnegative")
+
+
+def main(prog: str = "CommunitySIRS"):
+    """Parse CLI args, run simulations, and write requested CSV outputs."""
+    parser = build_arg_parser(prog)
+    args = parser.parse_args()
+    validate_args(args)
+    summary_rows, sample_rows = run_sweep(args)
+    out_path = Path(args.out)
+    with out_path.open("w", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=SUMMARY_FIELDS)
+        writer.writeheader()
+        writer.writerows(summary_rows)
+    if args.samples_out:
+        samples_path = Path(args.samples_out)
+        with samples_path.open("w", newline="") as fp:
+            writer = csv.DictWriter(fp, fieldnames=SAMPLE_FIELDS)
+            writer.writeheader()
+            writer.writerows(sample_rows)
+
+
+if __name__ == "__main__":
+    main("community_sirs")
